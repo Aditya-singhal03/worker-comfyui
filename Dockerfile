@@ -59,11 +59,14 @@ RUN chmod +x /usr/local/bin/comfy-node-install
 COPY scripts/comfy-manager-set-mode.sh /usr/local/bin/comfy-manager-set-mode
 RUN chmod +x /usr/local/bin/comfy-manager-set-mode
 
+RUN mkdir -p /comfyui/custom_nodes
+
 RUN comfy-node-install \
     comfyui-videohelpersuite \
     ComfyUI-WanVideoWrapper \
-    comfyui-frame-interpolation \
-    cd /comfyui/custom_nodes && \
+    comfyui-frame-interpolation
+
+RUN cd /comfyui/custom_nodes && \
     git clone https://github.com/JPS-GER/ComfyUI_JPS-Nodes.git
 
 WORKDIR /comfyui
