@@ -13,6 +13,8 @@ import uuid
 import tempfile
 import socket
 import traceback
+import boto3
+from urllib.parse import quote
 
 # Time to wait between API check attempts in milliseconds
 COMFY_API_AVAILABLE_INTERVAL_MS = 50
@@ -43,6 +45,55 @@ REFRESH_WORKER = os.environ.get("REFRESH_WORKER", "false").lower() == "true"
 # Helper: quick reachability probe of ComfyUI HTTP endpoint (port 8188)
 # ---------------------------------------------------------------------------
 
+def upload_to_r2(file_path):
+    """Uploads a file to a Cloudflare R2 bucket and returns the public URL."""
+    try:
+        account_id = os.environ['R2_ACCOUNT_ID']
+        access_key_id = os.environ['R2_ACCESS_KEY_ID']
+        secret_access_key = os.environ['R2_SECRET_ACCESS_KEY']
+        bucket_name = os.environ['R2_BUCKET_NAME']
+        public_url_base = os.environ['R2_PUBLIC_URL']
+    except KeyError as e:
+        print(f"ERROR: Missing required R2 environment variable: {e}")
+        return None
+
+    endpoint_url = f"https://{account_id}.r2.cloudflarestorage.com"
+    s3_client = boto3.client(
+        's3',
+        endpoint_url=endpoint_url,
+        aws_access_key_id=access_key_id,
+        aws_secret_access_key=secret_access_key,
+        region_name='apac'
+    )
+    object_name = os.path.basename(file_path)
+    try:
+        print(f"Uploading {object_name} to R2 bucket {bucket_name}...")
+        s3_client.upload_file(
+            file_path,
+            bucket_name,
+            object_name,
+            ExtraArgs={'ContentType': 'video/mp4'}
+        )
+        final_url = f"{public_url_base.rstrip('/')}/{quote(object_name)}"
+        print(f"File uploaded successfully. Public URL: {final_url}")
+        return final_url
+    except Exception as e:
+        print(f"An unexpected error occurred during R2 upload: {e}")
+        return None
+
+def get_file_data(filename, subfolder, file_type):
+    """Fetch file bytes from the ComfyUI /view endpoint."""
+    print(f"worker-comfyui - Fetching file data: type={file_type}, subfolder={subfolder}, filename={filename}")
+    data = {"filename": filename, "subfolder": subfolder, "type": file_type}
+    url_values = urllib.parse.urlencode(data)
+    try:
+        response = requests.get(f"http://{COMFY_HOST}/view?{url_values}", timeout=120)
+        response.raise_for_status()
+        print(f"worker-comfyui - Successfully fetched file data for {filename}")
+        return response.content
+    except Exception as e:
+        print(f"worker-comfyui - Error fetching file data for {filename}: {e}")
+        return None
 
 def _comfy_server_status():
     """Return a dictionary with basic reachability info for the ComfyUI HTTP server."""
@@ -474,6 +525,19 @@ def get_image_data(filename, subfolder, image_type):
         )
         return None
 
+def get_video_data(filename, subfolder, video_type):
+    # This function is very similar to get_image_data
+    print(f"worker-comfyui - Fetching video data: type={video_type}, subfolder={subfolder}, filename={filename}")
+    data = {"filename": filename, "subfolder": subfolder, "type": video_type}
+    url_values = urllib.parse.urlencode(data)
+    try:
+        response = requests.get(f"http://{COMFY_HOST}/view?{url_values}", timeout=120) # Longer timeout for video
+        response.raise_for_status()
+        print(f"worker-comfyui - Successfully fetched video data for {filename}")
+        return response.content
+    except Exception as e:
+        print(f"worker-comfyui - Error fetching video data for {filename}: {e}")
+        return None
 
 def handler(job):
     """
@@ -732,9 +796,41 @@ def handler(job):
                     else:
                         error_msg = f"Failed to fetch image data for {filename} from /view endpoint."
                         errors.append(error_msg)
+            
+            if "videos" in node_output:
+                print(f"worker-comfyui - Node {node_id} contains {len(node_output['videos'])} video(s)")
+                for video_info in node_output["videos"]:
+                    filename = video_info.get("filename")
+                    
+                    if not filename:
+                        errors.append(f"Skipping video in node {node_id} due to missing filename.")
+                        continue
+                    
+                    # Fetch the generated video bytes from the container
+                    video_bytes = get_file_data(filename, video_info.get("subfolder", ""), video_info.get("type"))
+                    
+                    if video_bytes:
+                        # Save the video to a temporary file to upload it
+                        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as temp_file:
+                            temp_file.write(video_bytes)
+                            temp_file_path = temp_file.name
+                        
+                        # Upload to R2 and get the direct URL
+                        video_url = upload_to_r2(temp_file_path)
+                        os.remove(temp_file_path) # Clean up the temp file
+                        
+                        if video_url:
+                            output_data.append({
+                                "filename": filename,
+                                "video_url": video_url
+                            })
+                        else:
+                            errors.append(f"Failed to upload {filename} to R2.")
+                    else:
+                        errors.append(f"Failed to fetch video data for {filename}.")
 
             # Check for other output types
-            other_keys = [k for k in node_output.keys() if k != "images"]
+            other_keys = [k for k in node_output.keys() if k != "images" or k != "videos"]
             if other_keys:
                 warn_msg = (
                     f"Node {node_id} produced unhandled output keys: {other_keys}."
@@ -768,7 +864,7 @@ def handler(job):
     final_result = {}
 
     if output_data:
-        final_result["images"] = output_data
+        final_result["videos"] = output_data
 
     if errors:
         final_result["errors"] = errors
